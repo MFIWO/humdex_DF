@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socket
 import struct
+import threading  # [추가] Keep socket waits off the teleop/retarget loop.
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -149,10 +150,26 @@ class XsensBodyReader:
         self._last_quat_by_seg: Dict[int, np.ndarray] = {}
         self._gmr_initial_yaw_inv_wxyz: Optional[np.ndarray] = None
 
+        # [추가] Same ownership pattern as SONIC PicoReader: one receiver + latest sample.
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._latest: Optional[Dict[str, Any]] = None
+        self._rx_sequence = 0
+        self._read_sequence = 0
+        self._rx_error: Optional[str] = None
+
     def initialize(self) -> None:
+        # [추가] Reinitialization must not leave an old receiver owning the socket.
+        if self._initialized:
+            self.close()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((str(self.cfg.listen_ip), int(self.cfg.listen_port)))
+        # [변경] Exclusive bind: a second teleop must not steal the existing stream.
+        try:
+            sock.bind((str(self.cfg.listen_ip), int(self.cfg.listen_port)))
+        except Exception:
+            sock.close()
+            raise
         sock.settimeout(max(0.005, float(self.cfg.socket_timeout_s)))
         self.sock = sock
         self._pending = {}
@@ -162,6 +179,14 @@ class XsensBodyReader:
         self._last_quat_by_seg = {}
         self._gmr_initial_yaw_inv_wxyz = None
         self._initialized = True
+        # [추가] socket_timeout_s now bounds only background receive/shutdown waits.
+        self._stop.clear()
+        self._latest = None
+        self._rx_sequence = self._read_sequence = 0
+        self._rx_error = None
+        self._thread = threading.Thread(target=self._receive_loop, args=(sock,),
+                                        daemon=True, name="xsens-udp-reader")
+        self._thread.start()
 
     @staticmethod
     def _quat_mul_wxyz(qa: np.ndarray, qb: np.ndarray) -> np.ndarray:
@@ -349,6 +374,7 @@ class XsensBodyReader:
         return {
             "ok": True,
             "sample_counter": int(sample_counter),
+            "source_time_code": int(_time_code),  # [추가] Preserve raw MVN clock, not Unix time.
             "datagram_index": int(datagram_counter_raw & 0x7F),
             "is_last": bool(datagram_counter_raw & 0x80),
             "num_body_segments": int(num_body_segments),
@@ -390,49 +416,71 @@ class XsensBodyReader:
                 body_frame_raw[name] = st.segments[seg_id]
             self._pending.pop(sample, None)
             self._last_frame_index = sample
-            return {"ok": True, "frame_index": sample, "body_frame": body_frame_raw}
+            return {"ok": True, "frame_index": sample, "body_frame": body_frame_raw,
+                    "source_time_code": d.get("source_time_code")}  # [추가]
 
         if st.got_last and bool(self.cfg.drop_incomplete_samples):
             # Final packet arrived but sample is incomplete.
             self._pending.pop(sample, None)
         return None
 
-    def read_frame(self) -> Dict[str, Any]:
-        if (not self._initialized) or (self.sock is None):
-            return {"ok": False, "reason": "not_initialized"}
-
-        self._prune_pending()
-        deadline = time.time() + max(0.005, float(self.cfg.socket_timeout_s))
-        latest_out: Optional[Dict[str, Any]] = None
-        recv_count = 0
-        while time.time() <= deadline:
-            if recv_count >= int(self._MAX_READ_DATAGRAMS_PER_CALL):
-                break
+    def _receive_loop(self, sock: socket.socket) -> None:
+        """[추가] Publish each complete sample immediately, with receipt timestamps."""
+        while not self._stop.is_set():
             try:
-                datagram, _addr = self.sock.recvfrom(65535)
-                recv_count += 1
+                datagram, _addr = sock.recvfrom(65535)
+                received_mono, received_wall = time.monotonic(), time.time()
             except socket.timeout:
-                break
-            except Exception as e:
-                return {"ok": False, "reason": f"socket_error:{e}"}
-
-            d = self._decode_datagram(datagram)
-            if not bool(d.get("ok", False)):
+                self._prune_pending()
                 continue
-            out = self._consume_datagram(d)
+            except Exception as e:
+                if not self._stop.is_set():
+                    with self._lock:
+                        self._rx_error = f"socket_error:{e}"
+                return
+            try:
+                self._prune_pending()
+                d = self._decode_datagram(datagram)
+                if not bool(d.get("ok", False)):
+                    continue
+                out = self._consume_datagram(d)
+            except Exception as e:
+                with self._lock:
+                    self._rx_error = f"decode_error:{e}"
+                continue
             if out is not None:
-                # Low-latency policy: keep draining and return the newest complete frame.
-                latest_out = out
-        if latest_out is not None:
-            return latest_out
-        return {"ok": False, "reason": "no_update"}
+                out["timestamp_monotonic"] = received_mono
+                out["timestamp_realtime"] = received_wall
+                with self._lock:
+                    self._rx_sequence += 1
+                    self._latest = out
+                    self._rx_error = None
+
+    def read_frame(self) -> Dict[str, Any]:
+        """[변경] Nonblocking latest-sample read; duplicate samples are not new poses."""
+        if not self._initialized:
+            return {"ok": False, "reason": "not_initialized"}
+        with self._lock:
+            meta = {"rx_frames_total": self._rx_sequence,
+                    "last_received_monotonic": (self._latest or {}).get("timestamp_monotonic")}
+            if self._rx_sequence == self._read_sequence or self._latest is None:
+                return {"ok": False, "reason": self._rx_error or "no_update", **meta}
+            self._read_sequence = self._rx_sequence
+            return {**self._latest, **meta}
 
     def close(self) -> None:
+        # [변경] Stop and join before resetting state shared with the receive thread.
+        self._stop.set()
         if self.sock is not None:
             try:
                 self.sock.close()
             except Exception:
                 pass
+        if self._thread is not None:
+            self._thread.join(timeout=max(0.005, float(self.cfg.socket_timeout_s)) + 0.5)
+            if self._thread.is_alive():
+                raise RuntimeError("Xsens receiver did not stop; refusing unsafe reinitialization")
+        self._thread = None
         self.sock = None
         self._initialized = False
         self._pending = {}

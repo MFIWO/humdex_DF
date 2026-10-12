@@ -157,6 +157,8 @@ class OrchestratedPipeline:
                 now_s=time.time(),
             )
             for _ in range(int(getattr(cfg, "max_steps", 1))):
+                # [추가] The rate limiter includes all work in this iteration.
+                self.state.context["loop_start_monotonic"] = time.monotonic()
                 stage_read_body_frame(self.state)
                 stage_read_hand_frame(self.state)
                 stage_apply_keyboard_state(self.state)

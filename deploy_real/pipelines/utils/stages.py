@@ -10,6 +10,13 @@ from typing import Any, Dict, Tuple
 
 import numpy as np
 
+# [추가] SONIC PICO-style reception/target time separation.
+from deploy_real.pipelines.utils.stream_timing import (
+    FixedRatePoseStream,
+    log_stream_timing,
+    sleep_until_next_tick,
+)
+
 from deploy_real.adapters.body.vdmocap_adapter import (
     VdmocapBodyConfig,
     VdmocapBodyReader,
@@ -179,6 +186,13 @@ def init_source_readers(
             components["body_source_kind"] = "xsens"
         except Exception as e:  # pragma: no cover - env dependent
             components["sdk_error"] = str(e)
+    # [LOCAL_CHANGE] Skip hand reader for body-only teleop
+    if str(cfg.hands).lower() == "none":
+        components["hand_reader"] = None
+        components["sdk_ready"] = bool(components.get("body_sdk_ready", False))
+        print("[body-only] Hand reader disabled")
+        return
+
     if selection.hand_adapter.endswith("vdhand_adapter"):
         try:
             hr = VdhandReader(
@@ -240,7 +254,15 @@ def stage_read_body_frame(state: Any) -> None:
         state.context["body_frame_status"] = "no_reader"
         state.context["stage_read_body_frame_ts"] = time.time()
         return
+    # [추가] Preserve source receipt time across GMR and the outgoing reference.
+    started = time.monotonic()
     out = br.read_frame()
+    state.context["body_read_ms"] = (time.monotonic() - started) * 1000.0
+    state.context["body_rx_frames"] = int(out.get("rx_frames_total", 0))
+    state.context["body_last_received_monotonic"] = out.get("last_received_monotonic")
+    state.context["body_sample_monotonic"] = out.get("timestamp_monotonic") if out.get("ok") else None
+    state.context["body_sample_realtime"] = out.get("timestamp_realtime") if out.get("ok") else None
+    state.context["body_source_time_code"] = out.get("source_time_code")
     if bool(out.get("ok", False)):
         state.context["body_frame"] = out.get("body_frame")
         state.context["body_frame_hand"] = out.get("hand_frame")
@@ -295,8 +317,10 @@ def stage_apply_keyboard_state(state: Any) -> None:
 
 
 def stage_step_rate_limiter(state: Any, cfg: Any) -> None:
-    if cfg.target_fps > 1e-6:
-        time.sleep(max(0.0, 1.0 / cfg.target_fps))
+    # [변경] A 20 ms period includes processing; it is not a 20 ms extra delay.
+    sleep_until_next_tick(state.context, float(cfg.target_fps))
+    if state.context.get("components", {}).get("body_source_kind") == "xsens":
+        log_stream_timing(state)
     state.context["stage_step_rate_limiter_ts"] = time.time()
 
 
@@ -828,7 +852,9 @@ def _stage_retarget_common(
 ) -> None:
     comps = state.context["components"]
     fr_raw = state.context.get("body_frame", None)
+    started = time.monotonic()  # [추가] Measure GMR separately from socket reads.
     qpos, fr_local, fr_gmr, retarget_status = _retarget_body_frame(comps, cfg, fr_raw)
+    state.context["retarget_ms"] = (time.monotonic() - started) * 1000.0
     state.context["retarget_status"] = retarget_status
     out = _compute_retarget_outputs(
         state=state,
@@ -1010,6 +1036,14 @@ def sonic_stage_init_components(state: Any, cfg: Any, selection: Any) -> None:
         safe_idle_use_numpy=True,
     )
     if bool(components.get("gmr_ready", False)):
+        # [추가] SONIC protocol v1 frame IDs represent 20 ms reference steps.
+        if components.get("body_source_kind") == "xsens":
+            if abs(float(cfg.target_fps) - 50.0) > 1e-6 or int(cfg.zmq_frame_index_step) != 1:
+                raise ValueError("Xsens/SONIC requires target_fps=50 and zmq_frame_index_step=1")
+            state.context["sonic_fixed_rate_stream"] = FixedRatePoseStream(
+                fps=50.0, num_frames=int(cfg.zmq_num_frames_to_send))
+            print("[xsens-sonic] async receive + 50 Hz interpolation; joint velocity enabled. "
+                  "Timestamps measure host receipt, not sensor capture.")
         _enable_sonic_zmq(components, cfg)
 
 
@@ -1031,6 +1065,32 @@ def sonic_stage_build_hand_tracking(state: Any, cfg: Any) -> None:
     )
 
 
+def _publish_xsens_sonic(state: Any, cfg: Any, comps: Dict[str, Any], pub: Dict[str, Any]) -> None:
+    """[추가] Emit time-resampled, post-ramp targets without relabelling old input."""
+    stamp = state.context.get("body_sample_monotonic")
+    wall = state.context.get("body_sample_realtime")
+    if stamp is None or wall is None or state.context.get("retarget_status") != "ok":
+        state.context["zmq_publish_status"] = "waiting_for_fresh_pose"
+        return
+    stream = state.context["sonic_fixed_rate_stream"]
+    previous_resets = stream.gap_resets
+    payload = stream.push(state.context["retarget_joint_pos29"],
+                          state.context["retarget_body_quat_w"], stamp, wall,
+                          catch_up=bool(cfg.zmq_catch_up))
+    if payload is None:
+        state.context["zmq_publish_status"] = "waiting_for_grid_tick"
+        return
+    if stream.gap_resets != previous_resets:
+        print("[teleop-warning] Input gap >250 ms: cleared interpolation history; "
+              "missing motion was not synthesized.", flush=True)
+    index = int(payload["frame_index"][-1])
+    status = _send_sonic_zmq_payload(comps, pub, payload, frame_index=index)
+    state.context["zmq_publish_status"] = status
+    if status == "ok":
+        state.zmq_frame_index = index + 1
+        state.context["sonic_publish_count"] = int(state.context.get("sonic_publish_count", 0)) + 1
+
+
 def sonic_stage_publish_body_zmq(state: Any, cfg: Any) -> None:
     comps = state.context["components"]
     pub = comps.get("zmq_publisher", None)
@@ -1041,6 +1101,10 @@ def sonic_stage_publish_body_zmq(state: Any, cfg: Any) -> None:
         body_35_pub = np.asarray(state.context.get("retarget_body_35", state.last_pub_body_35), dtype=np.float32).reshape(-1)
         if body_35_pub.shape[0] >= 35:
             state.context["retarget_joint_pos29"] = _mujoco29_to_isaaclab29(_mimic35_to_joint_pos29(body_35_pub))
+        # [추가] Keep the G1 encoder/protocol; change only Xsens stream timing.
+        if comps.get("body_source_kind") == "xsens":
+            _publish_xsens_sonic(state, cfg, comps, pub)
+            return
         hist = state.context.get("sonic_pose_hist", None)
         if not isinstance(hist, dict):
             hist_len = max(8, int(getattr(cfg, "zmq_num_frames_to_send", 1)) * 4)
