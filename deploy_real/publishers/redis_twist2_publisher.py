@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Dict
 
 
@@ -14,6 +15,14 @@ def publish_twist2_step(
     wuji_mode_right: str,
     now_ms: int,
 ) -> None:
+    # [ADDED Xsens sim-only] Isolated key: never publish legacy body/hand keys.
+    if os.environ.get("TWIST2_XSENS_SIM_ONLY") == "1":
+        if len(body_35) != 35:
+            raise ValueError(f"Xsens TWIST2 sim expected 35 floats, got {len(body_35)}")
+        redis_client.set("twist2_xsens_sim:reference", json.dumps({
+            "timestamp_ms": int(now_ms), "body_35": body_35,
+        }), px=500)
+        return
     robot_key = "unitree_g1_with_hands"
     key_action_body = f"action_body_{robot_key}"
     key_t_action = "t_action"

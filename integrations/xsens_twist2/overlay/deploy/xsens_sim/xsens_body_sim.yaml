@@ -1,0 +1,82 @@
+# [ADDED] Dedicated TWIST2 Xsens sim configuration. Original SONIC config unchanged.
+# Awinda 전신 전용: height, hands, listen_ip 변경
+runtime:
+  target_fps: 50.0
+  print_every: 120
+  max_steps: 100000000000
+network:
+  redis:
+    ip: localhost
+  mocap:
+    default:
+      ip: 192.168.0.139
+      port: 7000
+      index: 0
+      world_space: 0
+      local_port: 0
+    body:
+      ip: 192.168.0.139
+      port: 7000
+      index: 0
+    hand:
+      ip: 192.168.0.139
+      port: 7000
+      index: 1
+retarget:
+  actual_human_height: 1.75
+  hands: none
+  format: nokov
+  offset_to_ground: true
+control:
+  safe_idle_pose_id: '0'
+  ramp_ease: cosine
+  start_ramp_seconds: 3.0
+  toggle_ramp_seconds: 3.0
+  exit_ramp_seconds: 3.0
+  keyboard_toggle_send: true
+  keyboard_backend: stdin
+  toggle_send_key: k
+  hold_position_key: p
+  hand_source_timeout_s: 0.5
+  evdev_device: auto
+  evdev_grab: false
+adapters:
+  vdmocap: {}
+  vdhand:
+    hand_fk: true
+    hand_fk_end_site_scale: 0.858,0.882,0.882,0.882,0.882
+  manus:
+    address: tcp://localhost:8000
+    left_sn: 85ab6e24
+    right_sn: c152afa7
+    auto_assign: true
+    recv_timeout_ms: 20
+    flip_x: true
+  slimevr:
+    vmc_ip: 0.0.0.0
+    vmc_port: 39539
+    vmc_timeout_s: 0.5
+    vmc_rot_mode: local
+    vmc_use_fk: true
+    vmc_use_viewer_fk: true
+    vmc_fk_skeleton: bvh
+    vmc_bvh_path: assets/slimevr/bvh-recording.bvh
+    vmc_bvh_scale: 0.01
+  xsens:
+    listen_ip: 127.0.0.1
+    listen_port: 9763
+    socket_timeout_s: 0.05
+    character_id_filter: -1
+    drop_incomplete_samples: true
+policy:
+  sonic:
+    zmq_bind_host: 0.0.0.0
+    zmq_pose_port: 5556
+    zmq_pose_topic: pose
+    zmq_num_frames_to_send: 5
+    zmq_frame_index_step: 1
+    zmq_use_mailbox: false
+    zmq_catch_up: true
+  twist2:
+    smooth: false
+    smooth_window_size: 5
